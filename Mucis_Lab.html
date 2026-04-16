@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Audio Studio Lab - Ultimate Edition</title>
+    <style>
+        :root { --accent: #00f2ff; --bg: #030305; --card: #0d0d12; }
+        body { background: var(--bg); color: white; font-family: monospace; margin: 0; padding: 10px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        #glow { position: fixed; inset: 0; background: radial-gradient(circle at 10% 10%, rgba(0, 242, 255, 0.1), transparent 50%); pointer-events: none; opacity: 0; z-index: 0; }
+        .main-layout { display: grid; grid-template-columns: 1fr 320px; gap: 10px; flex-grow: 1; z-index: 1; overflow: hidden; }
+        .panel { background: var(--card); border: 1px solid #1f1f26; border-radius: 8px; padding: 15px; display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+        canvas { background: #000; border-radius: 4px; display: block; width: 100%; }
+        .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; background: #16161e; padding: 10px; border-radius: 4px; }
+        input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+        .stat-box { background: #16161e; padding: 5px; border-left: 3px solid var(--accent); font-size: 0.85em; margin-bottom: 5px; }
+        button { background: #222; color: white; border: 1px solid #444; padding: 8px; cursor: pointer; border-radius: 4px; font-family: monospace; transition: 0.2s; }
+        #meter-container { width: 100%; height: 180px; background: #000; border: 1px solid #333; position: relative; border-radius: 4px; margin-top: 10px; }
+        #meter-fill { width: 100%; height: 0%; background: linear-gradient(to top, #00ff00 0%, #ffff00 70%, #ff0000 100%); position: absolute; bottom: 0; }
+        #peak-line { width: 100%; height: 2px; background: white; position: absolute; bottom: 0; box-shadow: 0 0 5px white; }
+    </style>
+</head>
+<body>
+    <div id="glow"></div>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; z-index: 1;">
+        <h3 style="margin:0; color: var(--accent);">STUDIO_LAB // MASTER_CORE_V5</h3>
+        <input type="file" id="upload" accept="audio/*">
+    </div>
+
+    <div class="main-layout">
+        <div class="panel">
+            <div class="controls">
+                <div><small>Pitch/Speed</small><input type="range" id="pitch" min="0.5" max="2.0" step="0.01" value="1.0"></div>
+                <div><small>Low-Pass</small><input type="range" id="filter" min="20" max="15000" value="15000"></div>
+                <div><small>Pan</small><input type="range" id="pan" min="-1" max="1" step="0.1" value="0"></div>
+                <button id="autoPanBtn">AUTO-PAN: OFF</button>
+            </div>
+            <div style="position: relative; flex-grow: 1;">
+                <canvas id="specCanvas" style="height: 100%;"></canvas>
+                <canvas id="waveOverlay" style="position: absolute; top:0; left:0; height: 100%; background: transparent; pointer-events: none;"></canvas>
+            </div>
+            <audio id="player" controls style="width: 100%;"></audio>
+        </div>
+
+        <div class="panel">
+            <small>VectorScope (Stereo Image)</small>
+            <canvas id="vectorCanvas" height="180"></canvas>
+            <div id="meter-container">
+                <div id="meter-fill"></div>
+                <div id="peak-line"></div>
+            </div>
+            <div style="margin-top: 10px;">
+                <div class="stat-box">FPS: <span id="fpsVal">--</span></div>
+                <div class="stat-box">Peak: <span id="hzVal">0</span> Hz / <span id="noteVal">--</span></div>
+                <div class="stat-box">Bass Impact: <span id="bassVal">0</span></div>
+            </div>
+            <canvas id="heatCanvas" height="40" style="cursor: pointer;"></canvas>
+            <button id="exportBtn" style="background: #ff0055; margin-top: auto;">● RECORD REMIX</button>
+        </div>
+    </div>
+
+<script>
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    let audioCtx, analyser, lAnal, rAnal, source, filterNode, pannerNode, limiter;
+    let fData, tData, lData, rData, peakHold = 0, autoPan = false, lastT = performance.now();
+
+    const player = document.getElementById('player');
+    const spec = document.getElementById('specCanvas'), wave = document.getElementById('waveOverlay');
+    const sCtx = spec.getContext('2d', { alpha: false }), wCtx = wave.getContext('2d');
+    const tempC = document.createElement('canvas'), tempCtx = tempC.getContext('2d', { alpha: false });
+
+    function res() { [spec, wave, tempC].forEach(c => { c.width = spec.offsetWidth; c.height = spec.offsetHeight; }); }
+    window.onresize = res; res();
+
+    document.getElementById('upload').onchange = async (e) => {
+        if (!audioCtx) audioCtx = new AudioCtx();
+        player.src = URL.createObjectURL(e.target.files[0]);
+        const buf = await audioCtx.decodeAudioData(await e.target.files[0].arrayBuffer());
+        drawH(buf); initStudio();
+    };
+
+    function initStudio() {
+        if (source) source.disconnect();
+        analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
+        lAnal = audioCtx.createAnalyser(); rAnal = audioCtx.createAnalyser();
+        const split = audioCtx.createChannelSplitter(2);
+        filterNode = audioCtx.createBiquadFilter();
+        pannerNode = audioCtx.createStereoPanner();
+        limiter = audioCtx.createDynamicsCompressor();
+        limiter.threshold.setValueAtTime(-1.0, audioCtx.currentTime);
+        limiter.ratio.setValueAtTime(20, audioCtx.currentTime);
+
+        source = audioCtx.createMediaElementSource(player);
+        source.connect(filterNode).connect(pannerNode).connect(limiter);
+        limiter.connect(split);
+        split.connect(lAnal, 0); split.connect(rAnal, 1);
+        limiter.connect(analyser).connect(audioCtx.destination);
+
+        fData = new Uint8Array(analyser.frequencyBinCount);
+        tData = new Uint8Array(analyser.fftSize);
+        lData = new Uint8Array(lAnal.fftSize); rData = new Uint8Array(rAnal.fftSize);
+
+        document.getElementById('filter').oninput = (e) => filterNode.frequency.setTargetAtTime(e.target.value, audioCtx.currentTime, 0.05);
+        document.getElementById('pan').oninput = (e) => pannerNode.pan.setTargetAtTime(e.target.value, audioCtx.currentTime, 0.05);
+        document.getElementById('pitch').oninput = (e) => player.playbackRate = e.target.value;
+        document.getElementById('autoPanBtn').onclick = function() { autoPan = !autoPan; this.style.borderColor = autoPan ? "var(--accent)" : "#444"; };
+
+        run();
+    }
+
+    function run() {
+        requestAnimationFrame(run);
+        if (!audioCtx || player.paused) return;
+
+        const n = performance.now();
+        document.getElementById('fpsVal').innerText = Math.round(1000/(n-lastT));
+        lastT = n;
+
+        analyser.getByteFrequencyData(fData);
+        analyser.getByteTimeDomainData(tData);
+        lAnal.getByteTimeDomainData(lData);
+        rAnal.getByteTimeDomainData(rData);
+
+        if(autoPan) pannerNode.pan.setTargetAtTime(Math.sin(n/1000), audioCtx.currentTime, 0.1);
+
+        // Visuals: Spectrogram & Waveform
+        tempCtx.drawImage(spec, 0, 0);
+        sCtx.drawImage(tempC, 0, 2);
+        const bw = spec.width / fData.length;
+        for(let i=0; i<fData.length; i++) {
+            if(fData[i]>0) { sCtx.fillStyle = `hsl(${260-fData[i]}, 100%, ${fData[i]/4}%)`; sCtx.fillRect(i*bw, 0, bw+1, 2); }
+        }
+        wCtx.clearRect(0,0,wave.width, wave.height);
+        wCtx.strokeStyle = 'rgba(255,255,255,0.4)'; wCtx.beginPath();
+        let sw = wave.width/tData.length;
+        for(let i=0; i<tData.length; i++) {
+            let y = (tData[i]/255)*wave.height;
+            if(i===0) wCtx.moveTo(0,y); else wCtx.lineTo(i*sw,y);
+        }
+        wCtx.stroke();
+
+        // VectorScope mit Gitter
+        const vC = document.getElementById('vectorCanvas'), vX = vC.getContext('2d');
+        vX.fillStyle = 'rgba(0,0,0,0.15)'; vX.fillRect(0,0,vC.width,vC.height);//rgba(0,0,0,0.15)
+        vX.strokeStyle = '#8e8e8e'; vX.beginPath(); vX.moveTo(vC.width/2,0); vX.lineTo(vC.width/2,vC.height); vX.moveTo(0,vC.height/2); vX.lineTo(vC.width,vC.height/2); vX.stroke();//#111
+        vX.strokeStyle = '#00f2ff'; vX.beginPath();//#00f2ff
+        for(let i=0; i<lData.length; i+=4) vX.lineTo((lData[i]/255)*vC.width, (rData[i]/255)*vC.height);
+        vX.stroke();
+
+        // dB Meter & Peak Hold
+        let maxV = 0; for(let i=0; i<tData.length; i++) { let v = Math.abs((tData[i]-128)/128); if(v>maxV) maxV=v; }
+        let db = 20 * Math.log10(maxV + 0.00001);
+        let mH = Math.max(0, (db + 60) * 1.66);
+        document.getElementById('meter-fill').style.height = mH + "%";
+        if(mH > peakHold) peakHold = mH; else peakHold -= 0.3;
+        document.getElementById('peak-line').style.bottom = peakHold + "%";
+
+        // Nerd Stats
+        let fMax = -1, fIdx = -1; for(let i=0; i<fData.length; i++) { if(fData[i]>fMax) { fMax=fData[i]; fIdx=i; } }
+        const hz = Math.round(fIdx * (audioCtx.sampleRate/2 / fData.length));
+        document.getElementById('hzVal').innerText = hz;
+        document.getElementById('bassVal').innerText = fData[2];
+        document.getElementById('glow').style.opacity = fData[2]/255;
+    }
+
+    function drawH(b) {
+        const c = document.getElementById('heatCanvas'), x = c.getContext('2d');
+        c.width = c.offsetWidth; const d = b.getChannelData(0), s = Math.ceil(d.length/c.width);
+        for(let i=0; i<c.width; i++) {
+            let a=0; for(let j=0; j<s; j++) a += Math.abs(d[i*s+j]);
+            x.fillStyle = `hsl(${200-(a/s*400)}, 100%, 50%)`; x.fillRect(i,0,1,40);
+        }
+        c.onclick = (e) => player.currentTime = (e.offsetX/c.width)*player.duration;
+    }
+
+    // Recording Logic
+    let chunks = [];
+    document.getElementById('exportBtn').onclick = function() {
+        if(!this.rec) {
+            const dest = audioCtx.createMediaStreamDestination();
+            limiter.connect(dest);
+            this.rec = new MediaRecorder(dest.stream);
+            this.rec.ondataavailable = e => chunks.push(e.data);
+            this.rec.onstop = () => {
+                const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(chunks, {type:'audio/webm'}));
+                a.download = "master_remix.webm"; a.click();
+            };
+            this.rec.start(); this.innerText = "■ STOP & SAVE"; this.style.background = "white"; this.style.color = "black";
+        } else {
+            this.rec.stop(); this.rec = null; this.innerText = "● RECORD REMIX"; this.style.background = "#ff0055"; this.style.color = "white";
+        }
+    };
+</script>
+</body>
+</html>
